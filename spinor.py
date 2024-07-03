@@ -31,10 +31,10 @@ def calc_Hmm(*, nspin: int=1, nkpoints: int=1, nbands: int) -> NDArray:
 
     Hmm = np.zeros((nkpoints, 2*nbands, 2*nbands), dtype=np.complex128)
     for ikpoint in range(nkpoints):
-        Hmm[0::2, 0::2] = cprojs[0, ikpoint, :, :].conj() @ socmat[0, :, :] @ cprojs[0, ikpoint, :, :].T
-        Hmm[0::2, 1::2] = cprojs[0, ikpoint, :, :].conj() @ socmat[1, :, :] @ cprojs[1, ikpoint, :, :].T
-        Hmm[1::2, 0::2] = cprojs[1, ikpoint, :, :].conj() @ socmat[2, :, :] @ cprojs[0, ikpoint, :, :].T
-        Hmm[1::2, 1::2] = cprojs[1, ikpoint, :, :].conj() @ socmat[3, :, :] @ cprojs[1, ikpoint, :, :].T
+        Hmm[ikpoint, 0::2, 0::2] = cprojs[0, ikpoint, :, :].conj() @ socmat[0, :, :] @ cprojs[0, ikpoint, :, :].T
+        Hmm[ikpoint, 0::2, 1::2] = cprojs[0, ikpoint, :, :].conj() @ socmat[1, :, :] @ cprojs[1, ikpoint, :, :].T
+        Hmm[ikpoint, 1::2, 0::2] = cprojs[1, ikpoint, :, :].conj() @ socmat[2, :, :] @ cprojs[0, ikpoint, :, :].T
+        Hmm[ikpoint, 1::2, 1::2] = cprojs[1, ikpoint, :, :].conj() @ socmat[3, :, :] @ cprojs[1, ikpoint, :, :].T
 
     return Hmm
 
@@ -107,12 +107,6 @@ def recombine_spinor(A: NDArray, B: NDArray) -> tuple[NDArray, NDArray]:
     return (rA, rB)
 
 
-def solve_spinor():
-    """
-    """
-    pass
-
-
 def make_spinor(wavecar: str="WAVECAR"):
     wfn = vaspwfc(wavecar)
     assert wfn._lsoc is not True, "This WAVECAR contains spinors already."
@@ -131,6 +125,8 @@ def make_spinor(wavecar: str="WAVECAR"):
     # and then diagonalize Hmm to get new band eigenvalues
     # finally correct it
     for ikpoint in range(nkpoints):
+        nplw = wfn._nplws[ikpoint - 1]
+
         eigs = band_eigs[:, ikpoint, :].flatten()
         if nspin == 1:
             neweigs = np.zeros(eigs.size*2)
@@ -145,9 +141,34 @@ def make_spinor(wavecar: str="WAVECAR"):
                ), "Hmm not Hermitian."
         eigvals, eigvecs = np.linalg.eigh(Hmm)
 
-        # new_eigvec1, new_eigvec2 = eigvecs[]
+        # sort the eigvals and eigvecs in ascending order
+        sorted_idx = np.argsort(eigvals)
+        eigvals = eigvals[sorted_idx]
+        eigvecs = eigvecs[:, sorted_idx]
+
+        # once the eigvals and eigvecs are sorted, the spin-up and spin-down
+        # bands are interleaving
         eigvals[0::2] = (eigvals[0::2] + eigvals[1::2]) / 2.0
         eigvals[1::2] = eigvals[0::2]
+
+        spinor_coeffs = np.zeros((2*nbands, 2*nplw), dtype=np.complex128)
+
+        for iband in ibs[0::2]:
+            rA, rB = recombine_spinor(eigvecs[:,iband], eigvecs[:, iband+1])
+            eigvecs[:, iband  ] = rA
+            eigvecs[:, iband+1] = rB
+
+            ispin = min(nspin, 2)
+            
+            # spinor up
+            spinor_coeffs[iband,   :nplw ] = wfn.readBandCoeff(ispin=1,     ikpt=ikpoint, iband=iband//2 + 1)
+            # spinor up
+            spinor_coeffs[iband+1,  nplw:] = wfn.readBandCoeff(ispin=ispin, ikpt=ikpoint, iband=iband//2 + 1)
+
+        # Produce the real spinors using the eigen vectors
+        spinor_coeffs = eigvecs.T @ spinor_coeffs
+
+        # TODO, write the spinors to the WAVECAR
 
 
 if '__main__' == __name__:
