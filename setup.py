@@ -7,7 +7,7 @@ except ImportError:
     from distutils.core import setup
     HAVE_SETUPTOOLS = False
 
-PY_MODULES = ['vasp_constant', 'vaspwfc', 'aewfc', 'nac', 'unfold', 'procar', 'spinorb', 'spinor', 'sph_harm', 'paw', 'ewald', 'bsefatband', 'bsematrix', 'wfull']
+PY_MODULES = ['vasp_constant', 'vaspwfc', 'aewfc', 'nac', 'unfold', 'procar', 'spinorb', 'spinor', 'sph_harm', 'paw', 'ewald', 'bsefatband', 'bsematrix', 'wfull', 'waveder']
 SCRIPTS = ['bin/wfcplot', 'bin/tdmplot', 'bin/potplot', 'bin/nebplot', 'bin/bseplot', 'bin/spinormaker']
 INSTALL_REQUIRES = ['numpy', 'scipy', 'matplotlib', 'ase']
 

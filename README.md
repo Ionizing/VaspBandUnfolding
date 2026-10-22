@@ -226,6 +226,25 @@ A list of publications utilizing `VaspBandUnfolding` can be found [here](doc/Vas
   or `exciton_001_hole_rho.vasp`. The `bz` mode writes a PNG map of the folded
   first-BZ exciton density.
 
+  Both subcommands also accept `--tdm` to additionally compute each processed exciton's
+  transition dipole moment `mu = sum_kcv A_kcv * <v,k|-ir|c,k>` (a complex vector, in e*Angstrom)
+  and write a combined `<prefix>_TDM.dat` table. It uses `WAVEDER` when found/given
+  (`--waveder PATH`, auto-detected alongside `WAVECAR`/`BSEFATBAND`/`POSCAR` otherwise) and falls
+  back to `vaspwfc`'s plane-wave p-r approximation (no PAW one-center correction) when no
+  `WAVEDER` is available.
+
+  Non-collinear (`LSORBIT = .TRUE.`) `WAVECAR`/`BSEFATBAND` are supported: `bz` works unmodified
+  (it never reads `WAVECAR`). `realspace` reconstructs the spinor density via the same
+  reciprocal-space (G-vector) accumulation as the collinear case, now generalized to rotate the
+  spinor itself under symmetry operations using VASP's own `spinsym.F` algorithm
+  (axis-angle -> SU(2), ported from VASP's source, including the extra phase factor for improper
+  operations) -- **this spin-rotation direction/sign convention has not been independently
+  validated against a known-good VASP reference**, only spot-checked against textbook cases
+  (identity, inversion, mirrors); see `pauli_spin_rotation_matrix`'s docstring in `bsefatband.py`.
+  A minimal NCL example (real MoS2 SOC BSE data, truncated to 10 excitons, `bz` output plus a
+  real-space reconstruction rendered from a full run) is in
+  [examples/bseplot_ncl](./examples/bseplot_ncl).
+
   A complete MoSe2 example for this workflow is available in [examples/bseplot](./examples/bseplot).
 
   Example first-BZ density for the lowest exciton:

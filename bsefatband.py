@@ -49,8 +49,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from scipy.fftpack import ifftn
-
 from vaspwfc import vaspwfc
+from vasp_constant import AUTOA, RYTOEV
+from waveder import Waveder
 
 HEADER_RE = re.compile(
     r"^\s*(\d+)\s*BSE eigenvalue\s+([+\-]?\d+(?:\.\d*)?(?:[EeDd][+\-]?\d+)?)"
@@ -388,7 +389,10 @@ def circular_shift_grid(grid: np.ndarray, shift: Sequence[int]) -> np.ndarray:
     shift_i = tuple(int(x) for x in np.asarray(shift, dtype=int))
     if not any(shift_i):
         return np.array(grid, copy=True)
-    return np.roll(grid, shift_i, axis=(0, 1, 2))
+    # Always shift the trailing three (spatial) axes, so this also works for a leading
+    # spinor-component axis (shape (2, nx, ny, nz), as produced for lsoc reconstructions).
+    axes = (grid.ndim - 3, grid.ndim - 2, grid.ndim - 1)
+    return np.roll(grid, shift_i, axis=axes)
 
 
 def center_shift_from_hole_index(
@@ -463,6 +467,141 @@ def origin_supercell_image_from_primitive_frac(
     return wrap_frac(np.asarray(point_primitive_frac, dtype=float)) / np.asarray(supercell, dtype=float)
 
 
+def _reconstruct_fixed_particle_spinor(
+    recon: "ExcitonConstructor",
+    block: "ExcitonFatband",
+    fixed_frac: np.ndarray,
+    ngrid: np.ndarray,
+    supercell: Tuple[int, int, int],
+    keep: np.ndarray,
+    weights: np.ndarray,
+    used_weight_fraction: float,
+    fixed_particle: str,
+) -> ReconstructionResult:
+    """Spin-orbit (spinor) generalization of reconstruct_fixed_hole/reconstruct_fixed_electron.
+
+    For a spinor WAVECAR (NSPIN=1, two-component bands), the fixed particle's spinor component at
+    the fixed position plays the role the collinear "spin channel" plays in the non-SOC path: each
+    of the two components defines its own independent coherent-sum branch (its own beta/gamma
+    dict and its own reconstructed moving-particle spinor), and the final density is the
+    incoherent sum (sum of |.|^2) over both branches *and* over both spinor components of the
+    moving particle -- matching VASP's own convention of summing charge density over spinor
+    components (vaspwfc.wfc_r/readBandCoeff: rho = sum_s |phi_s|^2).
+
+    A non-identity symm_op is handled via the fast reciprocal-space path (see
+    ExcitonConstructor.matched_full_bloch_coefficients), which rotates the spinor itself using
+    pauli_spin_rotation_matrix -- see that function's docstring for the unvalidated-convention
+    caveat.
+    """
+    super_grid = np.asarray(ngrid, dtype=int) * np.asarray(supercell, dtype=int)
+    rho = np.zeros(tuple(int(x) for x in super_grid), dtype=float)
+    psi_single_branch: np.ndarray | None = None
+    branches_with_weight = 0
+
+    for branch in (0, 1):
+        beta: Dict[Tuple[int, int, bool, int, Tuple[float, float, float]], complex] = {}
+        for i in keep:
+            kmatch = recon.wav_kpoint_match(block.k_frac[i])
+            vb = int(block.ivb[i])
+            cb = int(block.icb[i])
+            A = complex(block.amplitude[i])
+            if fixed_particle == "hole":
+                fixed_band, moving_band = vb, cb
+            else:
+                fixed_band, moving_band = cb, vb
+            psi_fixed_at_pos = recon.sample_band_at_point(
+                ispin=1,
+                ikpt=kmatch.ikpt,
+                iband=fixed_band,
+                frac=fixed_frac,
+                ngrid=ngrid,
+                time_reversed=kmatch.time_reversed,
+                symm_op=kmatch.symm_op,
+            )[branch]
+            ktuple = tuple(float(x) for x in np.asarray(block.k_frac[i], dtype=float))
+            key = (kmatch.ikpt, moving_band, kmatch.time_reversed, kmatch.symm_op, ktuple)
+            contrib = A * np.conjugate(psi_fixed_at_pos)
+            if fixed_particle == "electron":
+                # Mirrors the extra e^{2i k.electron} phase in the original (non-SOC)
+                # reconstruct_fixed_electron.
+                kfrac = np.asarray(block.k_frac[i], dtype=float)
+                ephi = np.exp(2j * np.pi * np.dot(kfrac, np.asarray(fixed_frac, dtype=float)))
+                contrib = contrib * (ephi * ephi)
+            beta[key] = beta.get(key, 0.0 + 0.0j) + contrib
+
+        if recon.can_use_reciprocal_reconstruction():
+            # Fast path: scatter every contribution's G-vector coefficients directly into one
+            # supercell-sized reciprocal grid per spinor component, then a single ifftn each --
+            # same strategy as the non-SOC branch below, generalized to 2 spinor components.
+            # (The alternative -- primitive-cell wavefunction + tile_to_supercell per distinct
+            # (k,band,symm_op,time_reversed) combination -- costs one full O(supercell_volume)
+            # pass *per combination*, which is why this path exists: for a large supercell and
+            # many distinct combinations that is orders of magnitude slower.)
+            psi_q = np.zeros((2,) + tuple(int(x) for x in super_grid), dtype=np.complex128)
+            supercell_arr = np.asarray(supercell, dtype=float)
+            for (ikpt, moving_band, time_reversed, symm_op, ktuple), coeff in beta.items():
+                q_frac, band_coeff = recon.matched_full_bloch_coefficients(
+                    ispin=1,
+                    ikpt=ikpt,
+                    iband=moving_band,
+                    time_reversed=time_reversed,
+                    symm_op=symm_op,
+                )  # band_coeff has shape (2, nplane) for a spinor WAVECAR
+                q_super = q_frac * supercell_arr[None, :]
+                q_index = np.rint(q_super).astype(int)
+                mismatch = np.max(np.abs(q_super - q_index))
+                if mismatch > 1e-6:
+                    raise ValueError(
+                        f"Transformed reciprocal coefficients do not map onto the inferred supercell grid {supercell}; "
+                        f"largest mismatch = {mismatch:.3e}."
+                    )
+                q_index %= super_grid[None, :]
+                idx3 = (q_index[:, 0], q_index[:, 1], q_index[:, 2])
+                np.add.at(psi_q[0], idx3, coeff * band_coeff[0])
+                np.add.at(psi_q[1], idx3, coeff * band_coeff[1])
+            norm_fac = math.sqrt(np.prod(super_grid))
+            psi_branch = np.stack([ifftn(psi_q[0]) * norm_fac, ifftn(psi_q[1]) * norm_fac], axis=0)
+        else:
+            psi_branch = np.zeros((2,) + tuple(int(x) for x in super_grid), dtype=np.complex128)
+            for (ikpt, moving_band, time_reversed, symm_op, ktuple), coeff in beta.items():
+                kfrac = np.array(ktuple, dtype=float)
+                psi_moving_pc = recon.primitive_wavefunction_at_k(
+                    ispin=1,
+                    ikpt=ikpt,
+                    iband=moving_band,
+                    ngrid=ngrid,
+                    time_reversed=time_reversed,
+                    symm_op=symm_op,
+                )
+                psi_moving_sc = recon.tile_to_supercell(psi_moving_pc, kfrac, supercell)
+                psi_branch += coeff * psi_moving_sc
+
+        branch_rho = np.sum(np.abs(psi_branch) ** 2, axis=0)
+        if np.any(branch_rho):
+            branches_with_weight += 1
+            psi_single_branch = psi_branch
+        rho += branch_rho
+
+    psi_moving = psi_single_branch if branches_with_weight <= 1 else None
+    norm = float(np.sum(rho))
+    if norm > 0:
+        rho /= norm
+        if psi_moving is not None:
+            psi_moving = psi_moving / math.sqrt(norm)
+
+    return ReconstructionResult(
+        psi_electron=psi_moving,
+        density=rho,
+        raw_density_sum=norm,
+        used_transitions=len(keep),
+        total_transitions=len(weights),
+        used_weight_fraction=used_weight_fraction,
+        supercell=supercell,
+        primitive_grid=tuple(int(x) for x in np.asarray(ngrid, dtype=int)),
+        supercell_grid=tuple(int(x) for x in rho.shape),
+    )
+
+
 def reconstruct_fixed_hole(
     recon: "ExcitonConstructor",
     block: "ExcitonFatband",
@@ -473,6 +612,11 @@ def reconstruct_fixed_hole(
 ) -> ReconstructionResult:
     weights = np.abs(block.amplitude) ** 2
     used_weight_fraction = float(np.sum(weights[keep]) / np.sum(weights)) if np.sum(weights) > 0 else 0.0
+
+    if recon.wfc._lsoc:
+        return _reconstruct_fixed_particle_spinor(
+            recon, block, hole, ngrid, supercell, keep, weights, used_weight_fraction, fixed_particle="hole",
+        )
 
     beta: Dict[Tuple[int, int, int, bool, int, Tuple[float, float, float]], complex] = {}
     for i in keep:
@@ -571,6 +715,11 @@ def reconstruct_fixed_electron(
 ) -> ReconstructionResult:
     weights = np.abs(block.amplitude) ** 2
     used_weight_fraction = float(np.sum(weights[keep]) / np.sum(weights)) if np.sum(weights) > 0 else 0.0
+
+    if recon.wfc._lsoc:
+        return _reconstruct_fixed_particle_spinor(
+            recon, block, electron, ngrid, supercell, keep, weights, used_weight_fraction, fixed_particle="electron",
+        )
 
     gamma: Dict[Tuple[int, int, int, bool, int, Tuple[float, float, float]], complex] = {}
     for i in keep:
@@ -702,7 +851,11 @@ def dominant_fixed_particle_from_block(
         time_reversed=kmatch.time_reversed,
         symm_op=kmatch.symm_op,
     )
-    rho_fixed = np.abs(psi_fixed) ** 2
+    if recon.wfc._lsoc:
+        # psi_fixed has shape (2, nx, ny, nz); sum density over the two spinor components.
+        rho_fixed = np.sum(np.abs(psi_fixed) ** 2, axis=0)
+    else:
+        rho_fixed = np.abs(psi_fixed) ** 2
     primitive_index = np.array(np.unravel_index(int(np.argmax(rho_fixed)), rho_fixed.shape), dtype=int)
     primitive_frac = primitive_index / np.asarray(ngrid, dtype=float)
     supercell_frac = primitive_frac / np.asarray(supercell, dtype=float)
@@ -735,7 +888,7 @@ def dominant_fixed_particle_from_block(
 
 @dataclass
 class ReconstructionResult:
-    psi_electron: np.ndarray
+    psi_electron: np.ndarray | None
     density: np.ndarray
     raw_density_sum: float
     used_transitions: int
@@ -961,6 +1114,282 @@ def load_full_bz_kpoints(search_dirs: Sequence[Path]) -> List[FullBZKpoint]:
     return []
 
 
+# -----------------------------
+# Exciton transition dipole moment (TDM)
+# -----------------------------
+
+def find_waveder_path(search_dirs: Sequence[Path]) -> Path | None:
+    seen: set[Path] = set()
+    for dpath in search_dirs:
+        candidate = dpath / "WAVEDER"
+        if not candidate.is_file():
+            continue
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        return candidate
+    return None
+
+
+def symmetry_cartesian_rotation(op: "SymmetryOp", lattice: np.ndarray, bcell_no2pi: np.ndarray) -> np.ndarray:
+    r"""Cartesian rotation matrix for a Cartesian vector operator (e.g. the dipole/position
+    operator <v,k|-ir|c,k>) under symmetry operation `op`, replicating VASP's
+    CDER_BETWEEN_STATES_ROTATED (linear_optics.F):
+
+        S(L,I) = sum_K A(L,K) * sum_J ISYMOP(J,K) * B(I,J)
+               = lattice.T @ op.real_matrix.T @ bcell_no2pi
+
+    `lattice` is the POSCAR real-space lattice with rows = lattice vectors (as returned by
+    read_poscar_lattice). `bcell_no2pi` is the reciprocal lattice *without* the 2*pi factor
+    (a_i . b_j = delta_ij convention) with rows = reciprocal vectors -- this is
+    `ExcitonConstructor.wfc._Bcell`, NOT this module's own `reciprocal_lattice()` helper (which
+    bakes in a 2*pi factor for k-point physics and would silently give a wrong rotation here).
+    """
+    lattice = np.asarray(lattice, dtype=float)
+    bcell_no2pi = np.asarray(bcell_no2pi, dtype=float)
+    isymop = np.asarray(op.real_matrix, dtype=float)
+    return lattice.T @ isymop.T @ bcell_no2pi
+
+
+def assert_identity_rotation_sanity(symm_ops: Sequence["SymmetryOp"], lattice: np.ndarray, bcell_no2pi: np.ndarray, tol: float = 1e-6) -> None:
+    """Self-consistency check: symm_ops[0] is conventionally the identity operation, so its
+    Cartesian rotation matrix must be the identity. Catches a lattice/ISYMOP convention bug
+    immediately instead of silently producing wrong dipole vectors."""
+    if not symm_ops:
+        return
+    S0 = symmetry_cartesian_rotation(symm_ops[0], lattice, bcell_no2pi)
+    if not np.allclose(S0, np.eye(3), atol=tol):
+        raise RuntimeError(
+            "Internal error: symmetry_cartesian_rotation(symm_ops[0], ...) is not the identity "
+            f"matrix (got {S0}); the lattice/ISYMOP convention does not match what "
+            "cder_between_states_rotated()/TDM computation assumes. Refusing to produce "
+            "possibly-wrong transition dipole moments."
+        )
+
+
+_PAULI_X = np.array([[0, 1], [1, 0]], dtype=np.complex128)
+_PAULI_Y = np.array([[0, -1j], [1j, 0]], dtype=np.complex128)
+_PAULI_Z = np.array([[1, 0], [0, -1]], dtype=np.complex128)
+
+
+def pauli_spin_rotation_matrix(cart_rotation: np.ndarray, tol: float = 1e-6) -> np.ndarray:
+    r"""SU(2) spin-1/2 rotation matrix for the Cartesian O(3) operation `cart_rotation`
+    (proper or improper), i.e. the 2x2 matrix U such that a spinor (C_up, C_down) transforms
+    as [C_up', C_down'] = U @ [C_up, C_down] under this real-space symmetry operation.
+
+    Algorithm taken directly from VASP's own spinsym.F (set_spinrot/get_rotation/
+    get_spinorrot, module `spinsym`, used internally to build WHF for e.g. ALGO=BSE with
+    LSORBIT=.TRUE. + ISYM>0), NOT independently re-derived:
+
+      1. If det(cart_rotation) < 0 (improper operation), strip the inversion by negating the
+         matrix: proper = -cart_rotation (now det=+1); remember invflag=-1. Else proper =
+         cart_rotation, invflag=+1.
+      2. Get the rotation angle theta = acos((trace(proper)-1)/2) and axis n (from the
+         antisymmetric part of `proper` for generic theta; from the eigenvector of `proper`
+         with eigenvalue +1 when theta ~ pi, where the antisymmetric-part formula degenerates
+         -- VASP uses DGEEV there, we use np.linalg.eig).
+      3. U = exp(-i*theta/2 * (n . sigma)) = cos(theta/2) I - i sin(theta/2) (n . sigma).
+      4. If invflag < 0 (operation was improper): U = U * (-1j) -- this is VASP's explicit
+         convention for how a spinor picks up a phase under spatial inversion; it is not
+         something the det(S)*S axial-vector rule alone would give you.
+
+    CAVEAT: steps 1-4 are taken verbatim from VASP's algorithm and were spot-checked against
+    textbook cases (identity -> I; pure inversion -> -i*I; a z-axis mirror -> diag(-1,1), which
+    correctly flips in-plane <sigma_x>,<sigma_y> while preserving <sigma_z>, as a sigma_h mirror
+    should). What is NOT independently verified against a live VASP run is whether `U` should
+    be applied to a coefficient vector as `U @ c` (as this module does, for consistency with how
+    `cart_rotation`/op.real_matrix are already applied elsewhere here) or as its Hermitian
+    conjugate / transpose -- VASP's own spinsym.F applies `conjg(smat)^T` internally
+    (see rot_wave), via bookkeeping this module does not fully replicate. Treat results for
+    non-identity, non-time-reversal-only symmetry operations as best-effort.
+    """
+    S = np.asarray(cart_rotation, dtype=float)
+    det = float(np.linalg.det(S))
+    if det < 0:
+        proper = -S
+        invflag = -1
+    else:
+        proper = S
+        invflag = 1
+
+    # orthogonalize away numerical noise from the lattice/ISYMOP construction
+    u_svd, _, vt_svd = np.linalg.svd(proper)
+    proper = u_svd @ vt_svd
+
+    trace_arg = float(np.clip((np.trace(proper) - 1.0) / 2.0, -1.0, 1.0))
+    theta = math.acos(trace_arg)
+
+    if theta < tol:
+        axis = np.array([1.0, 0.0, 0.0])
+    elif math.pi - theta < tol:
+        # Antisymmetric-part formula degenerates at theta=pi (sin theta ~ 0); use the
+        # eigenvector with eigenvalue +1 instead, matching VASP's DGEEV fallback.
+        eigvals, eigvecs = np.linalg.eig(proper)
+        idx = int(np.argmin(np.abs(eigvals - 1.0)))
+        if abs(eigvals[idx] - 1.0) > 1e-4:
+            raise RuntimeError(
+                f"Could not find a unit eigenvalue for a theta~pi rotation matrix {proper} "
+                f"(eigenvalues={eigvals})."
+            )
+        axis = np.real(eigvecs[:, idx])
+        axis = axis / np.linalg.norm(axis)
+    else:
+        axis = np.array(
+            [
+                proper[2, 1] - proper[1, 2],
+                proper[0, 2] - proper[2, 0],
+                proper[1, 0] - proper[0, 1],
+            ]
+        ) / (2.0 * math.sin(theta))
+        axis = axis / np.linalg.norm(axis)
+
+    if theta < tol:
+        spinmat = np.eye(2, dtype=np.complex128)
+    else:
+        n_dot_sigma = axis[0] * _PAULI_X + axis[1] * _PAULI_Y + axis[2] * _PAULI_Z
+        spinmat = math.cos(theta / 2.0) * np.eye(2, dtype=np.complex128) - 1j * math.sin(theta / 2.0) * n_dot_sigma
+
+    if invflag < 0:
+        spinmat = spinmat * (-1j)
+
+    return spinmat
+
+
+def cder_between_states_rotated(
+    waveder: Waveder,
+    lattice: np.ndarray,
+    bcell_no2pi: np.ndarray,
+    symm_ops: Sequence["SymmetryOp"],
+    kmatch: "KpointMatch",
+    ispin: int,
+    n_valence: int,
+    n_conduction: int,
+) -> np.ndarray:
+    """Replicates linear_optics.F's CDER_BETWEEN_STATES_ROTATED: fetches <v,k|-ir|c,k> for one
+    BSEFATBAND transition from a parsed WAVEDER, rotating/conjugating it for a k-point that only
+    matches the irreducible WAVECAR mesh via a symmetry operation and/or time reversal.
+
+    n_valence/n_conduction/kmatch.ikpt/ispin are the usual 1-based VASP indices used elsewhere
+    in this module; waveder.cder itself is 0-based (see waveder.py).
+    """
+    n1, n2 = int(n_conduction), int(n_valence)
+    # VASP always stores the smaller band index in the <=NBANDS_CDER slot; since valence bands
+    # are always indexed below conduction bands in BD(ISP)%VBMIN..CBMAX, this swap direction
+    # (and the one-time LINV flip it causes, below) is fixed, not conditional.
+    if n2 > waveder.nbands_cder:
+        raise ValueError(
+            f"WAVEDER does not cover valence band {n_valence} (NBANDS_CDER={waveder.nbands_cder}); "
+            "regenerate WAVEDER with a large enough NBANDSV/NBANDS_CDER-equivalent window."
+        )
+    if not (1 <= n1 <= waveder.nbands):
+        raise ValueError(f"Conduction band {n_conduction} exceeds WAVEDER's NBANDS={waveder.nbands}.")
+    if not (1 <= kmatch.ikpt <= waveder.nkpoints):
+        raise ValueError(f"k-point index {kmatch.ikpt} exceeds WAVEDER's NKPOINTS={waveder.nkpoints}.")
+    if not (1 <= ispin <= waveder.nspin):
+        raise ValueError(f"Spin channel {ispin} exceeds WAVEDER's NSPIN={waveder.nspin}.")
+
+    cder_vec = np.array(waveder.cder[n1 - 1, n2 - 1, kmatch.ikpt - 1, ispin - 1, :], dtype=np.complex128)
+    if kmatch.symm_op:
+        S = symmetry_cartesian_rotation(symm_ops[kmatch.symm_op], lattice, bcell_no2pi)
+        cder_vec = S @ cder_vec
+    if not kmatch.time_reversed:
+        # Base LINV (= kmatch.time_reversed) flips exactly once from the always-on band swap above.
+        cder_vec = cder_vec.conj()
+    return cder_vec
+
+
+@dataclass
+class TDMResult:
+    index: int
+    bse_eigenvalue: float
+    mu: np.ndarray  # complex128, shape (3,), units e*Angstrom
+    source: str  # "waveder" or "vaspwfc"
+    n_transitions: int
+    n_skipped: int
+
+
+def compute_exciton_dipole(
+    recon: "ExcitonConstructor",
+    block: "ExcitonFatband",
+    *,
+    waveder: Waveder | None,
+    lattice: np.ndarray,
+) -> TDMResult:
+    """mu_exciton = sum_kvc A_kcv * (f_v - f_c) * <v,k|-ir|c,k>, replicating VASP's own CTRANS
+    accumulation in bse.F/bse_driver.F (occupation weight (f_v-f_c) == 1 for the standard
+    occupied-valence/empty-conduction transitions BSEFATBAND stores). Uses WAVEDER when given,
+    else falls back to vaspwfc's plane-wave p-r relation (no PAW one-center correction).
+    """
+    mu = np.zeros(3, dtype=np.complex128)
+    n_skipped = 0
+    bcell_no2pi = recon.wfc._Bcell
+    n_transitions = int(block.k_frac.shape[0])
+    for i in range(n_transitions):
+        kmatch = recon.wav_kpoint_match(block.k_frac[i])
+        vb = int(block.ivb[i])
+        cb = int(block.icb[i])
+        spin = recon.infer_transition_spin(
+            ikpt=kmatch.ikpt,
+            ivb=vb,
+            evb=float(block.evb[i]),
+            icb=cb,
+            ecb=float(block.ecb[i]),
+        )
+        if waveder is not None:
+            cder = cder_between_states_rotated(
+                waveder, lattice, bcell_no2pi, recon.symm_ops, kmatch,
+                spin.valence_spin, vb, cb,
+            )
+        else:
+            moment = recon.wfc.get_moment_mat(
+                [spin.valence_spin, kmatch.ikpt, vb],
+                [spin.conduction_spin, kmatch.ikpt, cb],
+            )
+            dE = (
+                recon.wfc._bands[spin.conduction_spin - 1, kmatch.ikpt - 1, cb - 1]
+                - recon.wfc._bands[spin.valence_spin - 1, kmatch.ikpt - 1, vb - 1]
+            )
+            if np.allclose(dE, 0.0):
+                # Matches vaspwfc.get_dipole_mat's own convention: the p-r relation is singular
+                # for degenerate v/c energies, so this transition's contribution is set to 0.
+                n_skipped += 1
+                continue
+            cder = (-1j / (dE / (2 * RYTOEV))) * np.asarray(moment, dtype=np.complex128) * AUTOA
+            if kmatch.symm_op:
+                S = symmetry_cartesian_rotation(recon.symm_ops[kmatch.symm_op], lattice, bcell_no2pi)
+                cder = S @ cder
+            if kmatch.time_reversed:
+                cder = cder.conj()
+        mu += complex(block.amplitude[i]) * cder
+
+    return TDMResult(
+        index=int(block.index) if block.index is not None else -1,
+        bse_eigenvalue=float(block.bse_eigenvalue) if block.bse_eigenvalue is not None else float("nan"),
+        mu=mu,
+        source="waveder" if waveder is not None else "vaspwfc",
+        n_transitions=n_transitions,
+        n_skipped=n_skipped,
+    )
+
+
+def write_tdm_table(path: Path, results: Sequence[TDMResult]) -> None:
+    with path.open("w", encoding="utf-8") as fh:
+        source = results[0].source if results else "n/a"
+        fh.write(f"# transition dipole moment, source={source}, units e*Angstrom\n")
+        fh.write("# index  R_eV  Re(mu_x)  Im(mu_x)  Re(mu_y)  Im(mu_y)  Re(mu_z)  Im(mu_z)  |mu|^2  source  n_skipped/n_transitions\n")
+        for r in results:
+            mu = r.mu
+            mu2 = float(np.sum(np.abs(mu) ** 2))
+            fh.write(
+                f"{r.index:6d}  {r.bse_eigenvalue:14.8E}  "
+                f"{mu[0].real:14.8E}  {mu[0].imag:14.8E}  "
+                f"{mu[1].real:14.8E}  {mu[1].imag:14.8E}  "
+                f"{mu[2].real:14.8E}  {mu[2].imag:14.8E}  "
+                f"{mu2:14.8E}  {r.source}  {r.n_skipped}/{r.n_transitions}\n"
+            )
+
+
 def signed_permutation_transform(
     psi: np.ndarray,
     real_matrix: np.ndarray,
@@ -1020,12 +1449,20 @@ def bloch_wavefunction_from_full_coefficients(
     ngrid: np.ndarray,
     tol: float = 1e-6,
 ) -> np.ndarray:
+    """Build a Bloch wavefunction on a real-space FFT grid from (q, C(q)) pairs, where
+    q = k + G. `coeff` is either shape (nplane,) for a scalar wavefunction, or shape
+    (2, nplane) for a spinor (returns shape (2, *ngrid) in that case).
+    """
     q_frac = np.asarray(q_frac, dtype=float)
     coeff = np.asarray(coeff, dtype=np.complex128)
     ngrid = np.asarray(ngrid, dtype=int)
     if q_frac.ndim != 2 or q_frac.shape[1] != 3:
         raise ValueError("Full Bloch coefficients must have shape (nplane, 3).")
-    if coeff.ndim != 1 or coeff.shape[0] != q_frac.shape[0]:
+    spinor = coeff.ndim == 2
+    if spinor:
+        if coeff.shape[0] != 2 or coeff.shape[1] != q_frac.shape[0]:
+            raise ValueError("Spinor coefficient array must have shape (2, nplane) matching q_frac.")
+    elif coeff.ndim != 1 or coeff.shape[0] != q_frac.shape[0]:
         raise ValueError("Plane-wave coefficient array is incompatible with q vectors.")
 
     k_frac = wrap_frac(q_frac[0])
@@ -1037,11 +1474,7 @@ def bloch_wavefunction_from_full_coefficients(
             "Transformed full-Bloch coefficients do not separate into one k vector plus integer G vectors; "
             f"largest mismatch = {mismatch:.3e}."
         )
-
-    phi_q = np.zeros(tuple(int(x) for x in ngrid), dtype=np.complex128)
     gmod = gvec_i % ngrid[None, :]
-    np.add.at(phi_q, (gmod[:, 0], gmod[:, 1], gmod[:, 2]), coeff)
-    psi = ifftn(phi_q) * math.sqrt(np.prod(ngrid))
 
     grid_frac = (
         np.mgrid[0:ngrid[0], 0:ngrid[1], 0:ngrid[2]]
@@ -1050,7 +1483,16 @@ def bloch_wavefunction_from_full_coefficients(
         / ngrid.astype(float)
     )
     phase = np.exp(2j * np.pi * (grid_frac @ k_frac)).reshape(tuple(int(x) for x in ngrid))
-    return psi * phase
+
+    def _build(component: np.ndarray) -> np.ndarray:
+        phi_q = np.zeros(tuple(int(x) for x in ngrid), dtype=np.complex128)
+        np.add.at(phi_q, (gmod[:, 0], gmod[:, 1], gmod[:, 2]), component)
+        psi = ifftn(phi_q) * math.sqrt(np.prod(ngrid))
+        return psi * phase
+
+    if spinor:
+        return np.stack([_build(coeff[0]), _build(coeff[1])], axis=0)
+    return _build(coeff)
 
 
 class ExcitonConstructor:
@@ -1066,6 +1508,7 @@ class ExcitonConstructor:
     ) -> None:
         self.poscar = poscar
         _, lattice, _, _, _, _, _ = read_poscar(poscar)
+        self.lattice = lattice
         search_dirs = [
             Path(str(wavecar)).resolve().parent,
             Path(str(bsefatband)).resolve().parent,
@@ -1300,15 +1743,20 @@ class ExcitonConstructor:
         if key not in self._psi_cache:
             psi = self.wfc.wfc_r(ispin=ispin, ikpt=ikpt, iband=iband, ngrid=ngrid, kr_phase=True)
             if isinstance(psi, list):
-                raise NotImplementedError(
-                    "SOC/noncollinear spinor WAVECAR returned a two-component spinor. "
-                    "This helper currently supports scalar wavefunctions only."
-                )
-            self._psi_cache[key] = np.asarray(psi, dtype=np.complex128)
+                # SOC/noncollinear spinor WAVECAR: wfc_r returns [psi_up, psi_down].
+                # Stack into shape (2, nx, ny, nz); both components are carried through
+                # the real-space reconstruction as a unit (see reconstruct_fixed_hole/electron).
+                psi = np.stack([np.asarray(p, dtype=np.complex128) for p in psi], axis=0)
+            else:
+                psi = np.asarray(psi, dtype=np.complex128)
+            self._psi_cache[key] = psi
         return self._psi_cache[key]
 
     def can_use_reciprocal_reconstruction(self) -> bool:
-        return (not self.wfc._lsoc) and (not self.wfc._lgam)
+        # SOC (spinor) WAVECARs now also go through this path -- see matched_full_bloch_coefficients
+        # for the spin-rotation handling. Only gamma-only WAVECARs (half plane-wave storage) stay on
+        # the slower real-space fallback; vaspwfc asserts lsoc and lgamma are never both true.
+        return not self.wfc._lgam
 
     def matched_full_bloch_coefficients(
         self,
@@ -1318,27 +1766,60 @@ class ExcitonConstructor:
         time_reversed: bool = False,
         symm_op: int = 0,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """Plane-wave coefficients for (ispin,ikpt,iband), mapped to the symmetry-equivalent
+        k-point (ikpt rotated by symm_op, optionally time-reversed). For a spinor (lsoc)
+        WAVECAR, `coeff` has shape (2, nplane) (up/down components); otherwise (nplane,).
+
+        For lsoc, the point-group rotation also mixes the two spinor components via
+        pauli_spin_rotation_matrix -- see that function's docstring for the important caveat
+        about its validation status. Pure time reversal uses the Kramers-pair relation
+        T(up,down) = (down*, -up*), matching ExcitonConstructor.primitive_wavefunction_at_k's
+        real-space (non-reciprocal) convention for consistency.
+        """
         key = (ispin, ikpt, iband, time_reversed, symm_op)
         if key not in self._coeff_cache:
             gvec = np.asarray(self.wfc.gvectors(ikpt=ikpt), dtype=float)
-            coeff = np.asarray(
+            raw = np.asarray(
                 self.wfc.readBandCoeff(ispin=ispin, ikpt=ikpt, iband=iband, norm=False),
                 dtype=np.complex128,
             )
-            if coeff.ndim != 1:
+            if raw.ndim != 1:
                 raise NotImplementedError(
-                    "Reciprocal-space reconstruction currently supports scalar WAVECAR coefficients only."
+                    "Reciprocal-space reconstruction currently supports 1D WAVECAR coefficient arrays only."
                 )
 
             q_frac = gvec + np.asarray(self.wfc._kvecs[ikpt - 1], dtype=float)[None, :]
-            if time_reversed:
-                q_frac = -q_frac
-                coeff = np.conjugate(coeff)
-            if symm_op:
-                op = self.symm_ops[symm_op]
-                q_frac = q_frac @ op.reciprocal_matrix.T
-                phase = np.exp(-2j * np.pi * np.sum(q_frac * op.tau_frac[None, :], axis=1))
-                coeff = coeff * phase
+
+            if self.wfc._lsoc:
+                nplw = raw.shape[0] // 2
+                if raw.shape[0] != 2 * nplw or nplw != gvec.shape[0]:
+                    raise ValueError(
+                        f"Spinor coefficient length {raw.shape[0]} is not 2x the G-vector count "
+                        f"{gvec.shape[0]} for ikpt={ikpt}."
+                    )
+                coeff = np.stack([raw[:nplw], raw[nplw:]], axis=0)  # shape (2, nplw)
+                if time_reversed:
+                    q_frac = -q_frac
+                    coeff = np.stack([np.conjugate(coeff[1]), -np.conjugate(coeff[0])], axis=0)
+                if symm_op:
+                    op = self.symm_ops[symm_op]
+                    q_frac = q_frac @ op.reciprocal_matrix.T
+                    phase = np.exp(-2j * np.pi * np.sum(q_frac * op.tau_frac[None, :], axis=1))
+                    coeff = coeff * phase[None, :]
+                    S_cart = symmetry_cartesian_rotation(op, self.lattice, self.wfc._Bcell)
+                    U = pauli_spin_rotation_matrix(S_cart)
+                    coeff = np.einsum("ab,bp->ap", U, coeff)
+            else:
+                coeff = raw
+                if time_reversed:
+                    q_frac = -q_frac
+                    coeff = np.conjugate(coeff)
+                if symm_op:
+                    op = self.symm_ops[symm_op]
+                    q_frac = q_frac @ op.reciprocal_matrix.T
+                    phase = np.exp(-2j * np.pi * np.sum(q_frac * op.tau_frac[None, :], axis=1))
+                    coeff = coeff * phase
+
             self._coeff_cache[key] = (q_frac, coeff)
         return self._coeff_cache[key]
 
@@ -1372,12 +1853,28 @@ class ExcitonConstructor:
             else:
                 psi = self.primitive_wavefunction(ispin, ikpt, iband, ngrid)
                 k_frac = np.asarray(self.wfc._kvecs[ikpt - 1], dtype=float)
-                if time_reversed:
-                    psi = np.conjugate(psi)
-                    k_frac = -k_frac
-                if symm_op:
-                    op = self.symm_ops[symm_op]
-                    psi = signed_permutation_transform(psi, op.real_matrix, op.tau_frac, k_frac=k_frac)
+                if self.wfc._lsoc:
+                    if time_reversed:
+                        # Spinor time reversal (Kramers pair): T(phi_up, phi_down) = (phi_down*, -phi_up*).
+                        psi = np.stack([np.conjugate(psi[1]), -np.conjugate(psi[0])], axis=0)
+                        k_frac = -k_frac
+                    if symm_op:
+                        raise NotImplementedError(
+                            f"Real-space reconstruction for a spin-orbit (spinor) WAVECAR only supports "
+                            f"direct k-point matches and pure time reversal; k-point {k_frac.tolist()} only "
+                            f"matched via a non-identity point-group operation (symm_op={symm_op}), which "
+                            "would require rotating the up/down spinor components into each other (a "
+                            "general SU(2) spin rotation) and is not implemented. Re-run the BSE "
+                            "calculation with ISYM=0, or restrict the analysis to transitions whose "
+                            "k-point matches the irreducible WAVECAR mesh directly or via time reversal only."
+                        )
+                else:
+                    if time_reversed:
+                        psi = np.conjugate(psi)
+                        k_frac = -k_frac
+                    if symm_op:
+                        op = self.symm_ops[symm_op]
+                        psi = signed_permutation_transform(psi, op.real_matrix, op.tau_frac, k_frac=k_frac)
             self._psi_match_cache[key] = psi
         return self._psi_match_cache[key]
 
@@ -1405,7 +1902,13 @@ class ExcitonConstructor:
                 sample_frac = idx / np.asarray(ngrid, dtype=float)
                 phase = np.exp(2j * np.pi * (q_frac @ sample_frac))
                 norm_fac = math.sqrt(np.prod(np.asarray(ngrid, dtype=int)))
-                self._sample_cache[key] = complex(np.dot(coeff, phase) / norm_fac)
+                if coeff.ndim == 2:
+                    self._sample_cache[key] = np.array(
+                        [complex(np.dot(coeff[0], phase) / norm_fac), complex(np.dot(coeff[1], phase) / norm_fac)],
+                        dtype=np.complex128,
+                    )
+                else:
+                    self._sample_cache[key] = complex(np.dot(coeff, phase) / norm_fac)
             else:
                 psi = self.primitive_wavefunction_at_k(
                     ispin,
@@ -1415,10 +1918,22 @@ class ExcitonConstructor:
                     time_reversed=time_reversed,
                     symm_op=symm_op,
                 )
-                self._sample_cache[key] = complex(psi[idx])
+                if self.wfc._lsoc:
+                    # psi has shape (2, nx, ny, nz); sample both spinor components.
+                    self._sample_cache[key] = np.array(
+                        [complex(psi[0][idx]), complex(psi[1][idx])], dtype=np.complex128
+                    )
+                else:
+                    self._sample_cache[key] = complex(psi[idx])
         return self._sample_cache[key]
 
     def tile_to_supercell(self, psi_pc: np.ndarray, k_frac: np.ndarray, supercell: Tuple[int, int, int]) -> np.ndarray:
+        if psi_pc.ndim == 4:
+            # Spinor wavefunction, shape (2, nx, ny, nz): tile each component independently.
+            return np.stack(
+                [self.tile_to_supercell(psi_pc[s], k_frac, supercell) for s in range(psi_pc.shape[0])],
+                axis=0,
+            )
         sx, sy, sz = supercell
         nx, ny, nz = psi_pc.shape
         out = np.zeros((sx * nx, sy * ny, sz * nz), dtype=np.complex128)
@@ -2179,7 +2694,6 @@ def add_realspace_arguments(parser: argparse.ArgumentParser) -> None:
         "so the script can restore the correct full-BZ Bloch phases when WAVECAR stores "
         "only irreducible k points."
     )
-    parser.add_argument("--wavecar", type=Path, default=Path("WAVECAR"))
     parser.add_argument("--bsefatband", type=Path, default=Path("BSEFATBAND"))
     parser.add_argument("--poscar", type=Path, default=Path("POSCAR"))
     parser.add_argument("--exciton", type=int, required=True, help="1-based exciton index")
@@ -2193,14 +2707,27 @@ def add_realspace_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prefix", type=str, default="exciton")
     parser.add_argument("--output-dir", type=Path, default=Path("."))
     parser.add_argument("--write-amplitude", action="store_true", help="Also write real/imag parts of the reconstructed amplitude.")
-    parser.add_argument("--spin-channel", type=int, default=None, help="For NSPIN=2 WAVECARs, force a collinear spin channel (1-based). If omitted, infer it from BSEFATBAND band energies and raise on ambiguity.")
-    parser.add_argument("--lsorbit", action="store_true", help="Pass lsorbit=True to vaspwfc when reading WAVECAR.")
-    parser.add_argument("--lgamma", action="store_true", help="Pass lgamma=True to vaspwfc when reading WAVECAR.")
-    parser.add_argument("--gamma-half", type=str, default="x", choices=["x", "z"])
+    add_wavecar_arguments(parser)
     parser.set_defaults(center_fixed_particle=False)
     parser.add_argument("--center-fixed-particle", dest="center_fixed_particle", action="store_true", help="Circularly shift the output so the fixed particle lies near the supercell center.")
     parser.add_argument("--center-expectation-value", action="store_true", help="Circularly shift the output so the moving-particle density expectation value lies near the supercell center.")
     parser.add_argument("--center-r", dest="center_expectation_value", action="store_true", help="Alias for --center-expectation-value.")
+    add_dipole_arguments(parser)
+
+
+def add_wavecar_arguments(parser: argparse.ArgumentParser) -> None:
+    """WAVECAR-related args shared by realspace reconstruction and --tdm (on either subcommand)."""
+    parser.add_argument("--wavecar", type=Path, default=Path("WAVECAR"))
+    parser.add_argument("--spin-channel", type=int, default=None, help="For NSPIN=2 WAVECARs, force a collinear spin channel (1-based). If omitted, infer it from BSEFATBAND band energies and raise on ambiguity.")
+    parser.add_argument("--lsorbit", action="store_true", help="Pass lsorbit=True to vaspwfc when reading WAVECAR.")
+    parser.add_argument("--lgamma", action="store_true", help="Pass lgamma=True to vaspwfc when reading WAVECAR.")
+    parser.add_argument("--gamma-half", type=str, default="x", choices=["x", "z"])
+
+
+def add_dipole_arguments(parser: argparse.ArgumentParser) -> None:
+    """--tdm and its WAVEDER option, shared by both the realspace and bz subcommands."""
+    parser.add_argument("--tdm", action="store_true", help="Also compute each processed exciton's transition dipole moment (vector, e*Angstrom) and write a combined <prefix>_TDM.dat table. Uses WAVEDER if found/given, else falls back to vaspwfc's plane-wave p-r approximation (no PAW one-center correction).")
+    parser.add_argument("--waveder", type=Path, default=None, help="Path to WAVEDER (default: auto-detect alongside WAVECAR/BSEFATBAND/POSCAR). Only used with --tdm.")
 
 
 def add_bz_arguments(parser: argparse.ArgumentParser) -> None:
@@ -2224,6 +2751,69 @@ def add_bz_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tile-radius", type=int, default=1, help="Neighbor-shell radius used to tile first-BZ density for display.")
     parser.add_argument("--show-neighbor-bz", action="store_true", help="Draw faint neighboring BZ outlines in addition to the dashed first-BZ marker.")
     parser.add_argument("--save-kdensity", action="store_true", help="Save folded k-density table (*.dat) for each exciton.")
+    add_wavecar_arguments(parser)
+    add_dipole_arguments(parser)
+
+
+def resolve_tdm_waveder(
+    args: argparse.Namespace,
+    wavecar_path: Path,
+    bsefatband_path: Path,
+    poscar_path: Path,
+) -> Waveder | None:
+    """Resolve --waveder once per run: explicit path, else auto-detect alongside
+    WAVECAR/BSEFATBAND/POSCAR (same search-dir pattern as load_symmetry_ops), else fall back
+    to vaspwfc (returns None)."""
+    if args.waveder is not None:
+        waveder_path = Path(args.waveder)
+        if not waveder_path.is_file():
+            raise SystemExit(f"--waveder path does not exist: {waveder_path}")
+    else:
+        search_dirs = [
+            Path(str(wavecar_path)).resolve().parent,
+            Path(str(bsefatband_path)).resolve().parent,
+            Path(str(poscar_path)).resolve().parent,
+        ]
+        waveder_path = find_waveder_path(search_dirs)
+    if waveder_path is None:
+        print(
+            "[tdm] No WAVEDER found/given; falling back to vaspwfc's plane-wave p-r "
+            "approximation (no PAW one-center correction)."
+        )
+        return None
+    waveder = Waveder.from_binary(waveder_path)
+    print(
+        f"[tdm] Using WAVEDER: {waveder_path} "
+        f"(NBANDS={waveder.nbands}, NBANDS_CDER={waveder.nbands_cder}, "
+        f"NKPOINTS={waveder.nkpoints}, NSPIN={waveder.nspin})"
+    )
+    return waveder
+
+
+def run_tdm(
+    recon: "ExcitonConstructor",
+    blocks: Sequence["ExcitonFatband"],
+    waveder: Waveder | None,
+    lattice: np.ndarray,
+    output_dir: Path,
+    prefix: str,
+) -> Path:
+    assert_identity_rotation_sanity(recon.symm_ops, lattice, recon.wfc._Bcell)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results: List[TDMResult] = []
+    for block in blocks:
+        result = compute_exciton_dipole(recon, block, waveder=waveder, lattice=lattice)
+        mu2 = float(np.sum(np.abs(result.mu) ** 2))
+        print(
+            f"[tdm] exciton {result.index}: E={result.bse_eigenvalue:.6f} eV  "
+            f"mu={np.round(result.mu, 6).tolist()}  |mu|^2={mu2:.6f}  source={result.source}  "
+            f"skipped={result.n_skipped}/{result.n_transitions}"
+        )
+        results.append(result)
+    out_path = output_dir / f"{prefix}_TDM.dat"
+    write_tdm_table(out_path, results)
+    print(f"[saved] {out_path}")
+    return out_path
 
 
 def run_realspace(args: argparse.Namespace) -> int:
@@ -2268,6 +2858,11 @@ def run_realspace(args: argparse.Namespace) -> int:
         spin_channel=args.spin_channel,
     )
     block = recon.fatband.read_excitons([args.exciton])[0]
+
+    if args.tdm:
+        lattice = read_poscar_lattice(args.poscar)
+        waveder = resolve_tdm_waveder(args, args.wavecar, args.bsefatband, args.poscar)
+        run_tdm(recon, [block], waveder, lattice, args.output_dir, args.prefix)
 
     if ngrid is None:
         ngrid = recon.wfc._ngrid.copy() * 2
@@ -2352,11 +2947,27 @@ def run_realspace(args: argparse.Namespace) -> int:
     rho_path = outdir / f"{args.prefix}_{args.exciton:03d}_{moving_particle}_rho.vasp"
     write_scalar_vasp(rho_path, poscar_header, output_rho)
 
+    amplitude_paths: List[Path] = []
     if args.write_amplitude and output_psi is not None:
-        re_path = outdir / f"{args.prefix}_{args.exciton:03d}_{moving_particle}_real.vasp"
-        im_path = outdir / f"{args.prefix}_{args.exciton:03d}_{moving_particle}_imag.vasp"
-        write_scalar_vasp(re_path, poscar_header, output_psi.real)
-        write_scalar_vasp(im_path, poscar_header, output_psi.imag)
+        if output_psi.ndim == 4:
+            # Spinor amplitude (shape (2, nx, ny, nz)): write up/down components separately.
+            for comp, label in enumerate(("up", "down")):
+                re_path = outdir / f"{args.prefix}_{args.exciton:03d}_{moving_particle}_{label}_real.vasp"
+                im_path = outdir / f"{args.prefix}_{args.exciton:03d}_{moving_particle}_{label}_imag.vasp"
+                write_scalar_vasp(re_path, poscar_header, output_psi[comp].real)
+                write_scalar_vasp(im_path, poscar_header, output_psi[comp].imag)
+                amplitude_paths.extend([re_path, im_path])
+        else:
+            re_path = outdir / f"{args.prefix}_{args.exciton:03d}_{moving_particle}_real.vasp"
+            im_path = outdir / f"{args.prefix}_{args.exciton:03d}_{moving_particle}_imag.vasp"
+            write_scalar_vasp(re_path, poscar_header, output_psi.real)
+            write_scalar_vasp(im_path, poscar_header, output_psi.imag)
+            amplitude_paths.extend([re_path, im_path])
+    elif args.write_amplitude and output_psi is None and recon.wfc._lsoc:
+        print(
+            "[note] --write-amplitude skipped: the reconstructed density is an incoherent sum of "
+            "both spin-orbit branches, so no single complex amplitude field exists for it."
+        )
 
     print(f"Exciton index           : {args.exciton}")
     print(f"Fixed particle          : {fixed_particle}")
@@ -2389,9 +3000,8 @@ def run_realspace(args: argparse.Namespace) -> int:
         print(f"Expectation shift       : {tuple(int(x) for x in expectation_shift)}")
     print(f"Supercell POSCAR        : {sc_poscar}")
     print(f"Density file            : {rho_path}")
-    if args.write_amplitude and output_psi is not None:
-        print(f"Amplitude (real)        : {re_path}")
-        print(f"Amplitude (imag)        : {im_path}")
+    for amp_path in amplitude_paths:
+        print(f"Amplitude file          : {amp_path}")
     print()
     print("Notes:")
     print("  1) This reconstructs pseudo-wavefunctions from WAVECAR and ignores PAW augmentation.")
@@ -2409,6 +3019,15 @@ def run_realspace(args: argparse.Namespace) -> int:
         print("  7) The output density and supercell POSCAR were circularly shifted so the sampled fixed particle lies near the box center.")
     elif args.center_expectation_value:
         print("  7) The output density and supercell POSCAR were circularly shifted so the moving-particle density expectation value lies near the box center.")
+    if recon.wfc._lsoc:
+        print("  8) SOC/noncollinear WAVECAR: the fixed particle's spinor component at the fixed "
+              "position is treated as an extra branch (like a spin channel), summed incoherently "
+              "with the other component in the final density; pure time reversal uses the Kramers "
+              "pair relation T(up,down)=(down*,-up*). A BSE k-point that only matches the "
+              "irreducible WAVECAR mesh via a non-identity symmetry operation rotates the spinor "
+              "using VASP's own spinsym.F algorithm (axis-angle -> SU(2)); this direction/sign "
+              "convention has only been spot-checked against textbook cases, not an independent "
+              "VASP reference -- see pauli_spin_rotation_matrix's docstring.")
     return 0
 
 
@@ -2435,6 +3054,20 @@ def run_bz(args: argparse.Namespace) -> int:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = args.prefix if args.prefix else input_path.stem
+
+    if args.tdm:
+        recon = ExcitonConstructor(
+            wavecar=args.wavecar,
+            bsefatband=input_path,
+            poscar=args.poscar,
+            lsorbit=args.lsorbit,
+            lgamma=args.lgamma,
+            gamma_half=args.gamma_half,
+            spin_channel=args.spin_channel,
+        )
+        lattice = read_poscar_lattice(args.poscar)
+        waveder = resolve_tdm_waveder(args, args.wavecar, input_path, args.poscar)
+        run_tdm(recon, blocks, waveder, lattice, output_dir, prefix)
 
     for block in blocks:
         bz_map = exciton_bz_density(
@@ -2479,8 +3112,10 @@ def run_bz(args: argparse.Namespace) -> int:
 
 
 def infer_default_mode(argv: Sequence[str]) -> str:
+    # Note: --wavecar/--lsorbit/--lgamma/--gamma-half/--spin-channel/--tdm/--waveder are now
+    # valid on both subcommands (needed for --tdm on `bz` too), so they're no longer
+    # realspace-exclusive signals here; only flags unique to realspace reconstruction remain.
     realspace_flags = {
-        "--wavecar",
         "--hole",
         "--hole-from-max-akcv",
         "--electron",
@@ -2489,10 +3124,6 @@ def infer_default_mode(argv: Sequence[str]) -> str:
         "--cumulative-weight",
         "--fft-grid",
         "--write-amplitude",
-        "--spin-channel",
-        "--lsorbit",
-        "--lgamma",
-        "--gamma-half",
         "--center-fixed-particle",
         "--center-expectation-value",
         "--center-r",
